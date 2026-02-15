@@ -62,10 +62,10 @@ This diagram precisely illustrates the internal structure of a Neo4j node record
 ```mermaid
 graph LR
     subgraph "Node Record (15 Bytes)"
-        B1["Byte 1<br/>(In-Use Flag)"] --- B5["Bytes 2-5<br/>(Relationship Pointer)"]
+        B1["Byte 1<br/>(In-Use Flag)<br/>0: Free/Deleted<br/>1: Active"] --- B5["Bytes 2-5<br/>(Relationship Pointer)"]
         B5 --- B9["Bytes 6-9<br/>(Property Pointer)"]
         B9 --- B14["Bytes 10-14<br/>(Label Pointer)"]
-        B14 --- B15["Byte 15<br/>(Dense Node Flag)"]
+        B14 --- B15["Byte 15<br/>(Dense Node Flag)<br/>0: Not Dense<br/>1: Dense"]
     end
 
     B5 --> R("Relationships.db<br/>(Circular Doubly Linked List)")
@@ -119,3 +119,70 @@ _Why is this better?_ Cypher handles the recursion and backtracking internally u
 
 - [ ] Install Neo4j Desktop or use Neo4j Aura (Free Tier).
 - [ ] Run the `:play movie-graph` tutorial.
+
+### 2.4 Zooming on Byte 1 (In-Use Flag): Node Lifecycle & ID Reuse
+
+This flag dictates the state of the 15-byte node record and is central to how Neo4j manages its fixed-size storage and reuses internal IDs.
+
+#### 1. Active Node Lifecycle (Byte 1 = 1)
+When you create a node (e.g., `CREATE (n:User {name:'Alice'})`), Neo4j performs the following steps:
+-   **Allocates ID:** Neo4j finds a free 15-byte slot in `nodes.db` and assigns it an internal ID (e.g., 101).
+-   **Sets Flag:** It sets Byte 1 of that record to `1` (Active).
+-   **Sets Pointers:** It populates the other 3 pointers (Relationships, Properties, Labels) to point to the start of Alice's data in their respective stores.
+When you then search for this node (`MATCH (a) WHERE id(a) = 101`), Neo4j simply calculates the exact byte offset for ID 101 in `nodes.db`, jumps there, and checks Byte 1. If it's `1`, the node is active and can be used. This is an extremely fast $O(1)$ lookup.
+
+#### 2. Node Deletion & ID Reuse Cycle (Byte 1 = 0)
+This illustrates the critical concept of internal ID reuse, a direct consequence of fixed-size records and the In-Use flag.
+
+**Phase 1: Node Creation (Alice)**
+-   Alice is created, receiving Node ID 101. Her Node Record's Byte 1 is `1` (Active).
+
+**Phase 2: Node Deletion (Alice)**
+-   When you delete Alice (`DELETE (n:User {name:'Alice'})`), Neo4j doesn't physically erase her record. Instead, it flips Byte 1 of Node ID 101's record to `0` (Free). The slot is now available for reuse.
+
+**Phase 3: ID Reuse (Bob)**
+-   Later, if you create a new node (`CREATE (m:User {name:'Bob'})`), Neo4j will scan for available slots. It finds Node ID 101 (whose Byte 1 is `0`) and reuses it for Bob.
+-   Node ID 101's record now stores Bob's information, and its Byte 1 is flipped back to `1` (Active).
+
+**Phase 4: Ambiguous Lookup (If you rely on ID)**
+-   If your application then tries to `MATCH (x) WHERE id(x) = 101` expecting Alice, it will now find Bob, because Node ID 101 points to Bob.
+
+**This lifecycle highlights why relying on `id(n)` in application code is an anti-pattern; it's a transient, internal address, not a stable identifier.
+
+### 2.5 Simplified View: The In-Use Flag in Action (Byte 1)
+
+This flowchart distills the behavior of Neo4j's node records based solely on the value of Byte 1.
+
+```mermaid
+flowchart TD
+    subgraph "Neo4j Node Record Slot"
+        NR_Use["Node Record Slot (ID X)"]
+    end
+
+    NR_Use -- Check Byte 1 --> Decision{Byte 1 Value?}
+
+    Decision -- 0 --> Free["0: SLOT IS FREE / DELETED<br/>(Available for Reuse)"]
+    Decision -- 1 --> Active["1: SLOT IS ACTIVE / IN USE<br/>(Contains an active node's data pointers)"]
+
+    Free -- "New Node Created" --> Reused["SLOT REUSED for New Node<br/>(Byte 1 becomes 1)"]
+    Active -- "Node Deleted" --> Deleted["SLOT DELETED<br/>(Byte 1 becomes 0)"]
+```
+
+### 2.6 Simplified View: The Dense Node Flag in Action (Byte 15)
+
+This flowchart illustrates the behavior of the Dense Node Flag, which dictates how relationships are stored for a given node.
+
+```mermaid
+flowchart TD
+    subgraph "Neo4j Node (Alice)"
+        NR_Dense["Node Record (Alice)"]
+    end
+
+    NR_Dense -- Check Byte 15 --> Decision_Dense{Dense Node Flag Value?}
+
+    Decision_Dense -- 0 --> NotDense["0: NOT DENSE / NORMAL<br/>(Uses simple Linked List for Rels)"]
+    Decision_Dense -- 1 --> IsDense["1: DENSE / SUPERNODE<br/>(Uses Relationship Group Table for Rels)"]
+
+    NotDense -- "Relationships increase<br/>(Crosses threshold)" --> IsDense
+    IsDense -- "Relationships decrease<br/>(Drops below threshold)" --> NotDense
+```
